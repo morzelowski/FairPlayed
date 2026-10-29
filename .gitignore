@@ -1,4 +1,5 @@
 .DS_Store
+.fairplayed.env
 FairPlayed/build/
 FairPlayed/payload/
 FairPlayed/out/

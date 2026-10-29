@@ -38,54 +38,88 @@ The decrypted slice is written back with `cryptid = 0`.
 - An Apple Developer account (a free one works) to sign FairPlayed
 - iPhone with **Developer Mode** enabled: *Settings → Privacy & Security → Developer Mode*
 - The iPhone signed in to the Apple ID that owns the app. A quick check is that the app runs normally when installed from the App Store.
-- An encrypted App Store `.ipa` for that app, e.g. from [`ipatool`](https://github.com/majd/ipatool)
+- An encrypted App Store `.ipa` for that app, or [`ipatool`](https://github.com/majd/ipatool) installed with `brew install ipatool`
 
 ## Setup
 
-1. Open `FairPlayed/FairPlayed.xcodeproj` and set your own **Team** under *Signing & Capabilities*.
-2. Choose a unique bundle identifier and pass it as `BUNDLE_ID` when running the script.
-3. Find your device UDID:
+1. Add your Apple Developer account in **Xcode → Settings → Apple Accounts**.
+2. Before the first run, open `FairPlayed/FairPlayed.xcodeproj`, select the **FairPlayed** target, open **Signing & Capabilities**, enable **Automatically manage signing**, and choose your Team. Save the project and close Xcode.
+3. Run `fpdecrypt.sh`. It reads the `DEVELOPMENT_TEAM` value written by Xcode, saves it in the local Git-ignored `.fairplayed.env`, and immediately removes it from `project.pbxproj` so the private Team ID cannot be committed. Later runs reuse the local value. Do not rely on `security find-identity`: Keychain may contain valid certificates for old teams.
+4. Connect and unlock the iPhone, trust the Mac, and enable **Developer Mode**.
+5. The script automatically detects the physical iPhone when exactly one is connected. To list devices manually, run:
    ```bash
    xcrun devicectl list devices
+   ```
+6. If you want the script to download the encrypted IPA, authenticate `ipatool` once:
+   ```bash
+   ipatool auth login --email "your-email@example.com"
    ```
 
 ## Usage
 
-The complete sequence, from authenticating with `ipatool` to retrieving the decrypted IPA, is:
+### Fastest path: download and decrypt automatically
+
+> **First run only:** Open `FairPlayed/FairPlayed.xcodeproj` in Xcode. Select the **FairPlayed** target, open **Signing & Capabilities**, enable **Automatically manage signing**, and choose your Team. Save the project and close Xcode before running the script. `fpdecrypt.sh` will import the selected Team into the private `.fairplayed.env` file and remove it from the tracked Xcode project automatically.
+
+Find the target app and copy its bundle identifier:
 
 ```bash
-export APPLE_ID_EMAIL="your-email@example.com"
-export APP_BUNDLE_ID="com.example.target"
-export DEVICE_UDID="your-device-udid"
-export FAIRPLAYED_BUNDLE_ID="com.example.fairplayed"
-
-ipatool auth login --email "$APPLE_ID_EMAIL"
 ipatool search "your search term"
-
-mkdir -p FairPlayed/out
-ipatool download \
-  --bundle-identifier "$APP_BUNDLE_ID" \
-  --purchase \
-  --output FairPlayed/out/encrypted.ipa
-
-DEVICE="$DEVICE_UDID" \
-BUNDLE_ID="$FAIRPLAYED_BUNDLE_ID" \
-./fpdecrypt.sh FairPlayed/out/encrypted.ipa
 ```
 
-All values above are placeholders. Use the Apple ID that owns the app license, the target app's bundle identifier, your device UDID, and a unique bundle identifier for FairPlayed.
+Then run the entire download → build → install → decrypt → pull → verify pipeline:
 
-`fpdecrypt.sh` runs the whole pipeline:
+```bash
+export TARGET_APP_BUNDLE_ID="the.bundle.identifier.from.ipatool"
+./fpdecrypt.sh --download "$TARGET_APP_BUNDLE_ID"
+```
 
-1. **`embed_ipa.sh`** unpacks the IPA into `FairPlayed/payload/<App>/`.
+`--download` runs `ipatool download --purchase` and saves the input as `FairPlayed/out/encrypted.ipa`. The Apple ID must own a license for the target app.
+
+### Use an IPA you already have
+
+```bash
+./fpdecrypt.sh path/to/encrypted.ipa
+```
+
+By default the helper app uses `com.m0u.fairplayed`. This is **not** the target app's bundle identifier. The two identifiers serve different purposes:
+
+| Identifier | Purpose | Example in the command |
+|---|---|---|
+| Target app bundle ID | Tells `ipatool` which licensed app to download | `--download "$TARGET_APP_BUNDLE_ID"` |
+| FairPlayed bundle ID | Signs, installs, launches, and accesses the FairPlayed helper | Default: `com.m0u.fairplayed` |
+
+Never use the target app's bundle identifier as the FairPlayed bundle identifier: it belongs to another development team and Xcode cannot register it for you.
+
+### Overrides and troubleshooting
+
+Normally no options are required after the one-time Xcode signing setup. If device detection finds zero or multiple choices, specify the device explicitly. `--team-id` remains available mainly for CI:
+
+```bash
+./fpdecrypt.sh path/to/encrypted.ipa \
+  --device "your-physical-iphone-udid" \
+  --team-id "your-10-character-team-id" \
+  --fairplayed-bundle-id "com.m0u.fairplayed"
+```
+
+Run `./fpdecrypt.sh --help` for all options. The equivalent environment variables are `DEVICE`, `TEAM_ID`, `FAIRPLAYED_BUNDLE_ID`, and `PLATFORM`.
+
+After installing FairPlayed, the script pauses and asks you to verify the developer certificate on the iPhone under **Settings → General → VPN & Device Management → Developer App**. Press Enter only after the certificate is trusted. On later runs, this pause can be skipped with `--skip-trust-prompt` or `SKIP_TRUST_PROMPT=1`.
+
+`fpdecrypt.sh` automates the whole pipeline:
+
+1. Optionally downloads the licensed IPA with **`ipatool`**.
+2. Imports the Team selected in Xcode into a private local config, sanitizes the Xcode project, and detects the connected physical iPhone.
+3. **`embed_ipa.sh`** unpacks the IPA into `FairPlayed/payload/<App>/`.
    - The `.app` suffix is dropped, so `codesign` treats the payload as resources and leaves the binaries alone.
    - `Watch/` is removed.
    - The main `.sinf` is copied to every `SinfReplicationPaths` location, which is what `installd` would normally do for extensions and frameworks.
-2. **`xcodebuild`** builds and signs FairPlayed with the payload embedded, and installs it on the device.
-3. **FairPlayed** is launched with `FPD_AUTORUN=export`. It decrypts every encrypted Mach-O (main executable, frameworks, `.appex`) and packs `Documents/Decrypted/<App>-decrypted.ipa`.
-4. The script pulls the IPA into `FairPlayed/out/` and runs **`verify_ipa.sh`**.
+4. **`xcodebuild`** builds and signs FairPlayed with the payload embedded.
+5. Installs FairPlayed and waits for the user to verify the developer certificate on the iPhone.
+6. Launches FairPlayed with `FPD_AUTORUN=export`. It decrypts every encrypted Mach-O (main executable, frameworks, `.appex`) and packs `Documents/Decrypted/<App>-decrypted.ipa`.
+7. Pulls the IPA into `FairPlayed/out/` and runs **`verify_ipa.sh`**.
 
-If some binaries fail to decrypt, the output is named `<App>-PARTIAL.ipa` and those binaries keep their original encrypted contents. The full device log is saved to `FairPlayed/out/export-<App>.txt`.
+If some binaries fail to decrypt, the output is named `<App>-PARTIAL.ipa` and those binaries keep their original encrypted contents. The full device log is saved to `FairPlayed/out/export-<App>.txt`, and the complete Xcode log is saved to `FairPlayed/out/build.log`.
 
 One FairPlayed build handles one target app. Run the script again for the next IPA.
 
